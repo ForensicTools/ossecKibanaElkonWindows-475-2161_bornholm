@@ -17,11 +17,45 @@ yum update -y && yum upgrade -y
 yum install epel-release -y
 yum install vim wget net-tools -y
 
+####################### Install OSSEC server #######################
+yum install make gcc git -y
+yum install openssl-devel -y
+cd ~
+mkdir ossec_tmp && cd ossec_tmp
+git clone -b stable https://github.com/wazuh/wazuh.git ossec-wazuh
+cd ossec-wazuh
+sudo ./install.sh
+
+sudo /var/ossec/bin/ossec-control start
+
+ps aux | grep ossec
+
 ####################### Install Java #######################
 cd ~
 wget --no-cookies --no-check-certificate --header "Cookie: gpw_e24=http%3A%2F%2Fwww.oracle.com%2F; oraclelicense=accept-securebackup-cookie" "http://download.oracle.com/otn-pub/java/jdk/8u73-b02/jdk-8u73-linux-x64.rpm"
 sudo yum -y localinstall jdk-8u73-linux-x64.rpm
-rm ~/jdk-8u*-linux-x64.rpm
+rm -rf ~/jdk-8u*-linux-x64.rpm
+export JAVA_HOME=/usr/java/jdk1.8.0_60/jre
+echo "export JAVA_HOME=/usr/java/jdk1.8.0_60/jre" >> /etc/profile
+
+####################### Logstash #######################
+sudo rpm --import https://packages.elasticsearch.org/GPG-KEY-elasticsearch
+echo '[logstash-2.1]
+name=Logstash repository for 2.1.x packages
+baseurl=https://packages.elastic.co/logstash/2.1/centos
+gpgcheck=1
+gpgkey=https://packages.elastic.co/GPG-KEY-elasticsearch
+enabled=1
+' | tee /etc/yum.repos.d/logstash.repo
+yum install logstash -y
+
+git clone https://github.com/wazuh/wazuh
+cp ~/ossec_tmp/ossec-wazuh/extensions/logstash/01-ossec-singlehost.conf /etc/logstash/conf.d/
+cp ~/ossec_tmp/ossec-wazuh/extensions/elasticsearch/elastic-ossec-template.json  /etc/logstash/
+
+curl -O "http://geolite.maxmind.com/download/geoip/database/GeoLiteCity.dat.gz"
+gzip -d GeoLiteCity.dat.gz && sudo mv GeoLiteCity.dat /etc/logstash/
+usermod -a -G ossec logstash
 
 ####################### Install elasticsearch #######################
 sudo rpm --import http://packages.elastic.co/GPG-KEY-elasticsearch
@@ -32,12 +66,25 @@ gpgcheck=1
 gpgkey=http://packages.elastic.co/GPG-KEY-elasticsearch
 enabled=1
 ' | sudo tee /etc/yum.repos.d/elasticsearch.repo
+
 yum -y install elasticsearch
 sed -i 's/# network.host: 192.168.0.1/network.host: localhost/g' /etc/elasticsearch/elasticsearch.yml
+sed -i 's/# cluster.name: my-application/cluster.name: ossec/g' /etc/elasticsearch/elasticsearch.yml
+sed -i 's/# node.name: node-1/node.name: ossec_node1/g' /etc/elasticsearch/elasticsearch.yml
+echo "index.number_of_shards: 1
+index.number_of_replicas: 0
+" >> /etc/elasticsearch/elasticsearch.yml
 sudo systemctl start elasticsearch
 sudo systemctl enable elasticsearch
 
+curl -XGET localhost:9200
+curl -XGET 'http://localhost:9200/_cluster/health?pretty=true'
+
+cd ossec_tmp/ossec-wazuh/extensions/elasticsearch/ && curl -XPUT "http://localhost:9200/_template/ossec/" -d "@elastic-ossec-template.json"
+systemctl start logstash
+
 ####################### Install Kibana #######################
+sudo rpm --import https://packages.elastic.co/GPG-KEY-elasticsearch
 echo '[kibana-4.4]
 name=Kibana repository for 4.4.x packages
 baseurl=http://packages.elastic.co/kibana/4.4/centos
@@ -47,7 +94,7 @@ enabled=1
 ' | tee /etc/yum.repos.d/kibana.repo
 yum -y install kibana
 sed -i 's/# server.host: "0.0.0.0"/server.host: "localhost"/g' /opt/kibana/config/kibana.yml
-chkconfig kibana on
+systemctl enable kibana
 systemctl start kibana
 
 
@@ -57,6 +104,7 @@ yum -y install nginx httpd-tools
 yum install certbot -y
 htpasswd -c /etc/nginx/htpasswd.users kibanaadmin
 
+cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak
 echo '# For more information on configuration, see:
 #   * Official English Documentation: http://nginx.org/en/docs/
 #   * Official Russian Documentation: http://nginx.org/ru/docs/
@@ -104,6 +152,7 @@ echo 'server {
   }
 }
 ' | tee /etc/nginx/conf.d/letsencrypt.conf
+
 systemctl start nginx
 
 read -p "Enter a domain to create SSL Cert: " domain
@@ -115,9 +164,6 @@ if [[ $answer = l ]] ; then
   openssl dhparam -out /etc/nginx/ssl/dhparam.pem 2048
 
   rm -rf /etc/nginx/conf.d/letsencrypt.conf
-
-
-
 
   echo "server {
       listen 443 ssl;
@@ -218,71 +264,8 @@ else
   systemctl restart nginx
   setsebool -P httpd_can_network_connect 1
 
-  ####################### Install logstash #######################
-  echo '[logstash-2.2]
-name=logstash repository for 2.2 packages
-baseurl=http://packages.elasticsearch.org/logstash/2.2/centos
-gpgcheck=1
-gpgkey=http://packages.elasticsearch.org/GPG-KEY-elasticsearch
-enabled=1
-' | tee /etc/yum.repos.d/logstash.repo
-  yum -y install logstash
 fi
 
-read -p "Enter a domain to create SSL Cert: " domain
-cd /etc/pki/tls
-sudo openssl req -subj '/'$domain'/' -x509 -days 3650 -batch -nodes -newkey rsa:2048 -keyout private/logstash-forwarder.key -out certs/logstash-forwarder.crt
-echo 'input {
-  beats {
-    port => 5044
-    ssl => true
-    ssl_certificate => "/etc/pki/tls/certs/logstash-forwarder.crt"
-    ssl_key => "/etc/pki/tls/private/logstash-forwarder.key"
-  }
-}
-' | tee /etc/logstash/conf.d/02-beats-input.conf
-
-echo 'filter {
-  if [type] == "syslog" {
-    grok {
-      match => { "message" => "%{SYSLOGTIMESTAMP:syslog_timestamp} %{SYSLOGHOST:syslog_hostname} %{DATA:syslog_program}(?:\[%{POSINT:syslog_pid}\])?: %{GREEDYDATA:syslog_message}" }
-      add_field => [ "received_at", "%{@timestamp}" ]
-      add_field => [ "received_from", "%{host}" ]
-    }
-    syslog_pri { }
-    date {
-      match => [ "syslog_timestamp", "MMM  d HH:mm:ss", "MMM dd HH:mm:ss" ]
-    }
-  }
-}
-' | tee /etc/logstash/conf.d/10-syslog-filter.conf
-
-echo 'output {
-  elasticsearch {
-    hosts => ["localhost:9200"]
-    sniffing => true
-    manage_template => false
-    index => "%{[@metadata][beat]}-%{+YYYY.MM.dd}"
-    document_type => "%{[@metadata][type]}"
-  }
-}
-' | tee /etc/logstash/conf.d/30-elasticsearch-output.conf
-service logstash configtest
-systemctl restart logstash
-chkconfig logstash on
-
-####################### Load Kibana dashboards #######################
-cd ~
-curl -L -O https://download.elastic.co/beats/dashboards/beats-dashboards-1.1.0.zip
-yum -y install unzip
-unzip beats-dashboards-*.zip
-cd beats-dashboards-*
-./load.sh
-
-####################### Filebeat index #######################
-cd ~
-curl -O https://gist.githubusercontent.com/thisismitch/3429023e8438cc25b86c/raw/d8c479e2a1adcea8b1fe86570e42abab0f10f364/filebeat-index-template.json
-curl -XPUT 'http://localhost:9200/_template/filebeat?pretty' -d@filebeat-index-template.json
 
 ####################### Setup FirewllD #######################
 yum install firewalld -y
@@ -290,17 +273,5 @@ systemctl enable firewalld
 systemctl start firewalld
 firewall-cmd --zone=public --permanent --add-service=https
 firewall-cmd --zone=public --permanent --add-service=ssh
+firewall-cmd --permanent --zone=public --add-port=1514/udp
 firewall-cmd --reload
-
-
-#######################
-echo "These are the index patterns that we just loaded:
-
-[packetbeat-]YYYY.MM.DD
-[topbeat-]YYYY.MM.DD
-[filebeat-]YYYY.MM.DD
-[winlogbeat-]YYYY.MM.DD
-When we start using Kibana, we will select the Filebeat index pattern as our default.
-
-"
-
